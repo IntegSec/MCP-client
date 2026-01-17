@@ -220,17 +220,47 @@ export class HttpTransport extends Transport {
               return;
             }
 
-            // Try to parse as JSON
-            const response = JSON.parse(responseData);
-            this.emit('receive', response);
+            const contentType = res.headers['content-type'] || '';
 
-            if ('result' in response || 'error' in response) {
-              this.handleResponse(response as JsonRpcResponse);
-            } else if ('method' in response && !('id' in response)) {
-              this.handleNotification(response as JsonRpcNotification);
+            if (contentType.includes('text/event-stream')) {
+              const lines = responseData.split('\n');
+
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed.startsWith('data:')) continue;
+
+                const jsonPayload = trimmed.slice(5).trim();
+                if (!jsonPayload) continue;
+
+                try {
+                  const message = JSON.parse(jsonPayload);
+                  this.emit('receive', message);
+
+                  if ('result' in message || 'error' in message) {
+                    this.handleResponse(message as JsonRpcResponse);
+                  } else if ('method' in message && !('id' in message)) {
+                    this.handleNotification(message as JsonRpcNotification);
+                  }
+                } catch (err) {
+                  this.emit('error', new Error(`Failed to parse SSE data: ${jsonPayload}`));
+                }
+              }
+
+              resolve();
+            } else if (contentType.includes('application/json')) {
+              const response = JSON.parse(responseData);
+              this.emit('receive', response);
+
+              if ('result' in response || 'error' in response) {
+                this.handleResponse(response as JsonRpcResponse);
+              } else if ('method' in response && !('id' in response)) {
+                this.handleNotification(response as JsonRpcNotification);
+              }
+
+              resolve();
+            } else {
+              reject(new Error(`Unsupported Content-Type: ${contentType}`));
             }
-
-            resolve();
           } catch (error) {
             // JSON parse error - provide better error message
             if (error instanceof SyntaxError && responseData.trim()) {

@@ -68,6 +68,11 @@ export abstract class Transport extends EventEmitter {
   }
 
   protected handleNotification(notification: JsonRpcNotification): void {
+    // Silently ignore notifications/initialized from server (this is sent by client, not expected from server)
+    if (notification.method === 'notifications/initialized') {
+      return;
+    }
+
     this.emit('notification', notification);
   }
 }

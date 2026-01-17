@@ -128,6 +128,7 @@ export class SSETransport extends Transport {
       const headers: Record<string, string> = {
         'Accept': 'text/event-stream',
         'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
         ...this.customHeaders,
         ...this.authHeaders,
       };
@@ -270,10 +271,14 @@ export class SSETransport extends Transport {
         ...this.authHeaders,
       };
 
+      // POST requests typically go to root or /message, not /sse
+      // Try root path first, then /message if that doesn't work
+      const postPath = this.endpoint === '/sse' ? '/message' : this.endpoint;
+
       const options: https.RequestOptions = {
         hostname: urlObj.hostname,
         port: urlObj.port || (this.isHttps ? 443 : 80),
-        path: this.endpoint,
+        path: postPath,
         method: 'POST',
         headers,
         agent: this.agent,
