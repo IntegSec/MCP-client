@@ -24,6 +24,29 @@ export class TUI {
   private currentPopupContent: { raw: string; rendered: string; title: string; color: string } | null = null;
   private showRawInPopup = false;
 
+  // Enhanced traffic log features
+  private trafficFilter: {
+    method: string | null;
+    transport: string | null;
+    status: 'all' | 'success' | 'error' | 'pending';
+    searchText: string;
+    useRegex: boolean;
+  } = {
+    method: null,
+    transport: null,
+    status: 'all',
+    searchText: '',
+    useRegex: false
+  };
+  private trafficStats = {
+    totalRequests: 0,
+    successCount: 0,
+    errorCount: 0,
+    pendingCount: 0,
+    avgResponseTime: 0,
+    methodCounts: new Map<string, number>()
+  };
+
   constructor() {
     this.screen = blessed.screen({
       smartCSR: true,
@@ -275,6 +298,41 @@ export class TUI {
       this.showSavedConnections();
     });
 
+    // F7 - Show filter dialog
+    this.screen.key(['f7'], () => {
+      if (this.currentView === 'traffic') {
+        this.showFilterDialog();
+      }
+    });
+
+    // F8 - Show search dialog
+    this.screen.key(['f8'], () => {
+      if (this.currentView === 'traffic') {
+        this.showSearchDialog();
+      }
+    });
+
+    // F9 - Export traffic
+    this.screen.key(['f9'], () => {
+      if (this.currentView === 'traffic' && this.client) {
+        this.showExportDialog();
+      }
+    });
+
+    // F11 - Show detailed statistics
+    this.screen.key(['f11'], () => {
+      if (this.currentView === 'traffic') {
+        this.showStatsDialog();
+      }
+    });
+
+    // R - Replay request (when in traffic view)
+    this.screen.key(['r'], () => {
+      if (this.currentView === 'traffic' && this.activePanel === 'main') {
+        this.replaySelectedRequest();
+      }
+    });
+
     // Handle selection in main panel
     this.layout.main.key(['enter'], async () => {
       await this.handleMainSelection();
@@ -285,7 +343,16 @@ export class TUI {
       if (this.client) {
         this.client.clearTrafficLog();
         this.trafficLines = [];
+        this.trafficPairs = [];
         this.layout.traffic.setContent('');
+        // Reset statistics
+        this.trafficStats.totalRequests = 0;
+        this.trafficStats.successCount = 0;
+        this.trafficStats.errorCount = 0;
+        this.trafficStats.pendingCount = 0;
+        this.trafficStats.avgResponseTime = 0;
+        this.trafficStats.methodCounts.clear();
+        this.updateCurrentView();
         this.screen.render();
       }
     });
@@ -339,6 +406,11 @@ export class TUI {
         const method = data.method;
         let details = '';
 
+        // Update statistics
+        this.trafficStats.totalRequests++;
+        const methodCount = this.trafficStats.methodCounts.get(method) || 0;
+        this.trafficStats.methodCounts.set(method, methodCount + 1);
+
         if (data.method === 'tools/call' && data.params) {
           details = ` tool=${data.params.name}`;
           if (data.params.arguments) {
@@ -357,6 +429,7 @@ export class TUI {
 
         if ('id' in data && data.id !== undefined) {
           // Store request, waiting for response - store full data for detail view
+          this.trafficStats.pendingCount++;
           this.pendingRequests.set((data as any).id, { line: requestLine, data, timestamp: new Date() });
         } else {
           // Notification (no response expected)
@@ -369,27 +442,48 @@ export class TUI {
         let responseLine = '';
         if ('error' in data && data.error) {
           const errorMsg = this.escapeBlessedTags(String(data.error.message || 'Unknown error'));
-          
+
           // Suppress "method not found" errors for list methods (expected when server doesn't support them)
           if (responseId !== null && this.pendingRequests.has(responseId)) {
             const requestData = this.pendingRequests.get(responseId)!.data;
             if (requestData && 'method' in requestData) {
               const method = (requestData as any).method;
               const isListMethod = ['tools/list', 'resources/list', 'prompts/list'].includes(method);
-              const isMethodNotFoundError = errorMsg.includes('not a function') || 
-                                            errorMsg.includes('not found') || 
+              const isMethodNotFoundError = errorMsg.includes('not a function') ||
+                                            errorMsg.includes('not found') ||
                                             (data.error as any)?.code === -32601;
-              
+
               if (isListMethod && isMethodNotFoundError) {
                 // Don't log expected "method not supported" errors for list methods
                 this.pendingRequests.delete(responseId);
+                this.trafficStats.pendingCount--;
                 return; // Skip logging this error
               }
             }
           }
-          
+
+          // Update error statistics
+          this.trafficStats.errorCount++;
+          if (responseId !== null && this.pendingRequests.has(responseId)) {
+            this.trafficStats.pendingCount--;
+          }
+
           responseLine = `{cyan-fg}[${timestamp}]{/cyan-fg} {red-fg}<<<{/red-fg} ERROR: ${errorMsg}`;
         } else {
+          // Update success statistics
+          this.trafficStats.successCount++;
+          if (responseId !== null && this.pendingRequests.has(responseId)) {
+            this.trafficStats.pendingCount--;
+
+            // Calculate response time
+            const reqData = this.pendingRequests.get(responseId);
+            if (reqData && reqData.timestamp) {
+              const responseTime = Date.now() - reqData.timestamp.getTime();
+              const totalTime = this.trafficStats.avgResponseTime * (this.trafficStats.successCount - 1);
+              this.trafficStats.avgResponseTime = (totalTime + responseTime) / this.trafficStats.successCount;
+            }
+          }
+
           const resultPreview = ('result' in data && data.result)
             ? this.formatResultPreview(data.result)
             : 'OK';
@@ -547,18 +641,49 @@ export class TUI {
     if (!this.client) return;
 
     const logs = this.client.getTrafficLog();
-    this.layout.main.setLabel(` Traffic Details (${logs.length}) - Full Request/Response `);
+    const filtered = this.filterTrafficLogs(logs);
 
-    if (logs.length === 0) {
-      this.layout.main.setItems(['{yellow-fg}No traffic logged yet{/yellow-fg}']);
+    // Build filter status string
+    const filterParts: string[] = [];
+    if (this.trafficFilter.method) filterParts.push(`method=${this.trafficFilter.method}`);
+    if (this.trafficFilter.transport) filterParts.push(`transport=${this.trafficFilter.transport}`);
+    if (this.trafficFilter.status !== 'all') filterParts.push(`status=${this.trafficFilter.status}`);
+    if (this.trafficFilter.searchText) filterParts.push(`search="${this.trafficFilter.searchText}"`);
+    const filterStatus = filterParts.length > 0 ? ` [FILTERED: ${filterParts.join(', ')}]` : '';
+
+    // Build statistics header
+    const successRate = this.trafficStats.totalRequests > 0
+      ? ((this.trafficStats.successCount / this.trafficStats.totalRequests) * 100).toFixed(1)
+      : '0.0';
+    const avgTime = this.trafficStats.avgResponseTime.toFixed(0);
+    const statsHeader = `Total: ${this.trafficStats.totalRequests} | Success: {green-fg}${this.trafficStats.successCount}{/green-fg} | Error: {red-fg}${this.trafficStats.errorCount}{/red-fg} | Pending: {yellow-fg}${this.trafficStats.pendingCount}{/yellow-fg} | Success Rate: ${successRate}% | Avg Time: ${avgTime}ms`;
+
+    this.layout.main.setLabel(` Traffic History (${filtered.length}/${logs.length})${filterStatus} - Press Enter for details | F7=Filter F8=Search F9=Export F11=Stats `);
+
+    if (filtered.length === 0) {
+      this.layout.main.setItems([
+        '{yellow-fg}No traffic logged yet{/yellow-fg}',
+        '',
+        statsHeader
+      ]);
     } else {
-      // Build full request/response pairs with details
+      // Build enhanced table view with columns
       const items: string[] = [];
+
+      // Add statistics header
+      items.push(`{cyan-fg}${statsHeader}{/cyan-fg}`);
+      items.push(''); // Blank line
+
+      // Add table header
+      const header = this.formatTrafficTableRow('#', 'Time', 'Method', 'Transport', 'Status', 'Size', 'Duration', true);
+      items.push(header);
+      items.push('{cyan-fg}' + '─'.repeat(100) + '{/cyan-fg}');
+
       const processedIds = new Set<number | string>();
 
       // Process in reverse order (most recent first)
-      for (let i = 0; i < Math.min(logs.length, 20); i++) {
-        const log = logs[i];
+      for (let i = 0; i < Math.min(filtered.length, 100); i++) {
+        const log = filtered[i];
 
         // Skip if we already processed this request/response pair
         if ('id' in log.data) {
@@ -567,14 +692,14 @@ export class TUI {
           processedIds.add(logId);
         }
 
-        // Find matching request/response pair
+        // Find matching request/response pair IN THE FULL LOGS (not filtered)
         let requestLog = log;
         let responseLog = null;
 
         if (log.direction === 'received' && 'id' in log.data) {
           const requestId = (log.data as any).id;
-          // Find the request
-          for (let j = i + 1; j < logs.length; j++) {
+          // Find the request in full logs
+          for (let j = 0; j < logs.length; j++) {
             if (logs[j].direction === 'sent' && 'id' in logs[j].data &&
                 (logs[j].data as any).id === requestId) {
               requestLog = logs[j];
@@ -584,8 +709,8 @@ export class TUI {
           }
         } else if (log.direction === 'sent' && 'id' in log.data) {
           const requestId = (log.data as any).id;
-          // Find the response
-          for (let j = i - 1; j >= 0; j--) {
+          // Find the response in full logs
+          for (let j = 0; j < logs.length; j++) {
             if (logs[j].direction === 'received' && 'id' in logs[j].data &&
                 (logs[j].data as any).id === requestId) {
               responseLog = logs[j];
@@ -594,20 +719,119 @@ export class TUI {
           }
         }
 
-        // Format as compact single-line entry with timestamp and method
+        // Calculate row data
+        const num = String(i + 1);
         const timestamp = requestLog.timestamp.toISOString().substr(11, 12);
         const method = ('method' in requestLog.data) ? requestLog.data.method : 'unknown';
-        const respStatus = responseLog
-          ? ('error' in responseLog.data ? '{red-fg}ERROR{/red-fg}' : '{green-fg}OK{/green-fg}')
-          : '{gray-fg}pending{/gray-fg}';
+        const transport = requestLog.transport || 'unknown';
 
-        items.push(`{gray-fg}[${timestamp}]{/gray-fg} {yellow-fg}${this.escapeBlessedTags(method)}{/yellow-fg} → ${respStatus}`);
+        let status: string;
+        let statusColor: string;
+        if (!responseLog) {
+          status = 'PENDING';
+          statusColor = 'yellow';
+        } else if ('error' in responseLog.data) {
+          status = 'ERROR';
+          statusColor = 'red';
+        } else {
+          status = 'OK';
+          statusColor = 'green';
+        }
+
+        // Calculate size (rough estimate based on JSON length)
+        const reqSize = JSON.stringify(requestLog.data).length;
+        const respSize = responseLog ? JSON.stringify(responseLog.data).length : 0;
+        const totalSize = reqSize + respSize;
+        const sizeStr = totalSize > 1024 ? `${(totalSize / 1024).toFixed(1)}KB` : `${totalSize}B`;
+
+        // Calculate duration
+        let durationStr = '-';
+        if (responseLog && 'id' in requestLog.data) {
+          const duration = responseLog.timestamp.getTime() - requestLog.timestamp.getTime();
+          durationStr = duration > 1000 ? `${(duration / 1000).toFixed(2)}s` : `${duration}ms`;
+        }
+
+        const row = this.formatTrafficTableRow(num, timestamp, method, transport, `{${statusColor}-fg}${status}{/${statusColor}-fg}`, sizeStr, durationStr, false);
+        items.push(row);
       }
 
       this.layout.main.setItems(items);
     }
 
     this.screen.render();
+  }
+
+  private formatTrafficTableRow(num: string, time: string, method: string, transport: string, status: string, size: string, duration: string, isHeader: boolean): string {
+    // Column widths
+    const numW = 4;
+    const timeW = 12;
+    const methodW = 25;
+    const transportW = 10;
+    const statusW = 10;
+    const sizeW = 8;
+    const durationW = 10;
+
+    const pad = (str: string, width: number, color?: string) => {
+      // Strip color tags for length calculation
+      const stripped = str.replace(/\{[^}]+\}/g, '');
+      const padding = ' '.repeat(Math.max(0, width - stripped.length));
+      return str + padding;
+    };
+
+    if (isHeader) {
+      return `{bold}{cyan-fg}${pad(num, numW)} ${pad(time, timeW)} ${pad(method, methodW)} ${pad(transport, transportW)} ${pad(status, statusW)} ${pad(size, sizeW)} ${pad(duration, durationW)}{/cyan-fg}{/bold}`;
+    } else {
+      const escapedMethod = this.escapeBlessedTags(method);
+      return `${pad(num, numW)} {gray-fg}${pad(time, timeW)}{/gray-fg} {yellow-fg}${pad(escapedMethod, methodW)}{/yellow-fg} ${pad(transport, transportW)} ${pad(status, statusW)} ${pad(size, sizeW)} ${pad(duration, durationW)}`;
+    }
+  }
+
+  private filterTrafficLogs(logs: any[]): any[] {
+    return logs.filter(log => {
+      // Filter by method
+      if (this.trafficFilter.method) {
+        const method = ('method' in log.data) ? log.data.method : '';
+        if (!method.includes(this.trafficFilter.method)) return false;
+      }
+
+      // Filter by transport
+      if (this.trafficFilter.transport) {
+        if (log.transport !== this.trafficFilter.transport) return false;
+      }
+
+      // Filter by status (need to find matching response)
+      if (this.trafficFilter.status !== 'all') {
+        if (log.direction === 'sent' && 'id' in log.data) {
+          // Find response
+          const requestId = (log.data as any).id;
+          const responseLog = logs.find(l =>
+            l.direction === 'received' && 'id' in l.data && (l.data as any).id === requestId
+          );
+
+          if (this.trafficFilter.status === 'pending' && responseLog) return false;
+          if (this.trafficFilter.status === 'success' && (!responseLog || 'error' in responseLog.data)) return false;
+          if (this.trafficFilter.status === 'error' && (!responseLog || !('error' in responseLog.data))) return false;
+        }
+      }
+
+      // Filter by search text
+      if (this.trafficFilter.searchText) {
+        const searchStr = JSON.stringify(log.data).toLowerCase();
+        if (this.trafficFilter.useRegex) {
+          try {
+            const regex = new RegExp(this.trafficFilter.searchText, 'i');
+            if (!regex.test(searchStr)) return false;
+          } catch (e) {
+            // Invalid regex, fall back to simple search
+            if (!searchStr.includes(this.trafficFilter.searchText.toLowerCase())) return false;
+          }
+        } else {
+          if (!searchStr.includes(this.trafficFilter.searchText.toLowerCase())) return false;
+        }
+      }
+
+      return true;
+    });
   }
 
   private escapeBlessedTags(text: string): string {
@@ -748,9 +972,10 @@ export class TUI {
           break;
 
         case 'traffic':
-          const logs = this.client.getTrafficLog().slice(-50);
-          if (selectedIndex < logs.length) {
-            await this.showTrafficDetail(logs[selectedIndex]);
+          // Adjust for header rows (stats + blank + header + separator = 4 rows)
+          const actualIndex = selectedIndex - 4;
+          if (actualIndex >= 0) {
+            await this.showTrafficDetailByIndex(actualIndex);
           }
           break;
       }
@@ -837,78 +1062,295 @@ export class TUI {
     this.showMessage(`Prompt: ${prompt.name}`, formatted, 'magenta');
   }
 
-  private async showTrafficDetail(log: any): Promise<void> {
-    // Find matching request/response pair
+  private async showTrafficDetailByIndex(index: number): Promise<void> {
     const logs = this.client!.getTrafficLog();
-    const logIndex = logs.indexOf(log);
+    const filtered = this.filterTrafficLogs(logs);
 
-    let requestLog = log;
-    let responseLog = null;
+    if (index < 0 || index >= filtered.length) return;
 
-    // If this is a response, find its request
-    if (log.direction === 'received' && 'id' in log.data) {
-      const requestId = (log.data as any).id;
-      if (requestId !== undefined && requestId !== null) {
-        // Look backwards for the request with matching ID
-        for (let i = logIndex + 1; i < logs.length; i++) {
-          const logData = logs[i].data as any;
-          if (logs[i].direction === 'sent' && 'id' in logs[i].data &&
-              logData.id !== undefined && logData.id === requestId) {
-            requestLog = logs[i];
-            responseLog = log;
-            break;
+    const processedIds = new Set<number | string>();
+    let currentIndex = 0;
+
+    // Find the correct request/response pair at this index
+    for (let i = 0; i < filtered.length; i++) {
+      const log = filtered[i];
+
+      // Skip if we already processed this request/response pair
+      if ('id' in log.data) {
+        const logId = (log.data as any).id;
+        if (processedIds.has(logId)) continue;
+        processedIds.add(logId);
+      }
+
+      if (currentIndex === index) {
+        // Found the right pair, now get full request and response
+        let requestLog = log;
+        let responseLog = null;
+
+        if (log.direction === 'received' && 'id' in log.data) {
+          const requestId = (log.data as any).id;
+          // Find the request in the full logs (not filtered)
+          for (let j = 0; j < logs.length; j++) {
+            if (logs[j].direction === 'sent' && 'id' in logs[j].data &&
+                (logs[j].data as any).id === requestId) {
+              requestLog = logs[j];
+              responseLog = log;
+              break;
+            }
+          }
+        } else if (log.direction === 'sent' && 'id' in log.data) {
+          const requestId = (log.data as any).id;
+          // Find the response in the full logs (not filtered)
+          for (let j = 0; j < logs.length; j++) {
+            if (logs[j].direction === 'received' && 'id' in logs[j].data &&
+                (logs[j].data as any).id === requestId) {
+              responseLog = logs[j];
+              break;
+            }
           }
         }
+
+        await this.showTrafficDetail(requestLog, responseLog);
+        return;
       }
+
+      currentIndex++;
     }
-    // If this is a request, find its response
-    else if (log.direction === 'sent' && 'id' in log.data) {
-      const requestId = (log.data as any).id;
-      if (requestId !== undefined && requestId !== null) {
-        // Look backwards for response with matching ID
-        for (let i = logIndex - 1; i >= 0; i--) {
-          const logData = logs[i].data as any;
-          if (logs[i].direction === 'received' && 'id' in logs[i].data &&
-              logData.id !== undefined && logData.id === requestId) {
-            responseLog = logs[i];
-            break;
-          }
-        }
-      }
-    }
-
-    // Format request and response JSON (already formatted with indentation)
-    const requestJson = this.formatForDisplay(requestLog.data);
-    const responseJson = responseLog
-      ? this.formatForDisplay(responseLog.data)
-      : '(pending - no response yet)';
-
-    // Split into lines for side-by-side display
-    const requestLines = requestJson.split('\n');
-    const responseLines = responseJson.split('\n');
-    const maxLines = Math.max(requestLines.length, responseLines.length);
-
-    // Calculate column width (half of 90% screen width, minus separator)
-    const colWidth = 60;
-
-    // Build side-by-side display
-    const lines: string[] = [];
-    lines.push(`{bold}{yellow-fg}REQUEST{/yellow-fg}{/bold} - ${requestLog.timestamp.toISOString()}`.padEnd(colWidth) +
-               ' {gray-fg}│{/gray-fg} ' +
-               `{bold}{green-fg}RESPONSE{/green-fg}{/bold}${responseLog ? ' - ' + responseLog.timestamp.toISOString() : ''}`);
-    lines.push(`{gray-fg}${'─'.repeat(colWidth)}{/gray-fg} {gray-fg}┼{/gray-fg} {gray-fg}${'─'.repeat(colWidth)}{/gray-fg}`);
-
-    for (let i = 0; i < maxLines; i++) {
-      const reqLine = requestLines[i] || '';
-      const respLine = responseLines[i] || '';
-
-      // Pad request line to column width
-      const paddedReq = reqLine.padEnd(colWidth).substring(0, colWidth);
-      lines.push(paddedReq + ' {gray-fg}│{/gray-fg} ' + respLine);
-    }
-
-    this.showMessage('Traffic Detail - Request/Response Pair', lines.join('\n'), 'cyan');
   }
+
+  private async showTrafficDetail(requestLog: any, responseLog: any | null): Promise<void> {
+    // Create a custom box with tabs for better viewing
+    const detailBox = blessed.box({
+      parent: this.screen,
+      top: 'center',
+      left: 'center',
+      width: '95%',
+      height: '90%',
+      border: { type: 'line' },
+      style: {
+        border: { fg: 'cyan', bold: true },
+      },
+      tags: true,
+      keys: true,
+      vi: true,
+      mouse: true,
+      scrollable: true,
+      alwaysScroll: true,
+      scrollbar: {
+        ch: '█',
+        track: { ch: '░' },
+        style: { fg: 'cyan', bg: 'black' },
+      },
+    });
+
+    let currentView: 'request' | 'response' | 'both' = 'both';
+
+    const updateContent = () => {
+      const requestJson = this.formatForDisplay(requestLog.data);
+      const responseJson = responseLog
+        ? this.formatForDisplay(responseLog.data)
+        : '{yellow-fg}(pending - no response yet){/yellow-fg}';
+
+      let content = '';
+      let label = '';
+
+      if (currentView === 'request') {
+        label = ' REQUEST - Press TAB=Both | 2=Response | F4/ESC=Close | PgUp/PgDn=Scroll ';
+        content = [
+          '{bold}{yellow-fg}' + '═'.repeat(120) + '{/yellow-fg}{/bold}',
+          '{bold}{yellow-fg}  REQUEST{/yellow-fg}{/bold}',
+          '{bold}{yellow-fg}' + '═'.repeat(120) + '{/yellow-fg}{/bold}',
+          '',
+          '{cyan-fg}Timestamp:{/cyan-fg} ' + requestLog.timestamp.toISOString(),
+          '{cyan-fg}Transport:{/cyan-fg} ' + (requestLog.transport || 'unknown'),
+          '{cyan-fg}Direction:{/cyan-fg} ' + requestLog.direction,
+          '',
+          '{bold}{green-fg}JSON Data:{/green-fg}{/bold}',
+          '{gray-fg}' + '─'.repeat(120) + '{/gray-fg}',
+          requestJson,
+          '',
+        ].join('\n');
+      } else if (currentView === 'response') {
+        label = ' RESPONSE - Press TAB=Both | 1=Request | F4/ESC=Close | PgUp/PgDn=Scroll ';
+        if (responseLog) {
+          content = [
+            '{bold}{green-fg}' + '═'.repeat(120) + '{/green-fg}{/bold}',
+            '{bold}{green-fg}  RESPONSE{/green-fg}{/bold}',
+            '{bold}{green-fg}' + '═'.repeat(120) + '{/green-fg}{/bold}',
+            '',
+            '{cyan-fg}Timestamp:{/cyan-fg} ' + responseLog.timestamp.toISOString(),
+            '{cyan-fg}Transport:{/cyan-fg} ' + (responseLog.transport || 'unknown'),
+            '{cyan-fg}Direction:{/cyan-fg} ' + responseLog.direction,
+            '{cyan-fg}Duration:{/cyan-fg} ' + (responseLog.timestamp.getTime() - requestLog.timestamp.getTime()) + 'ms',
+            '',
+            '{bold}{green-fg}JSON Data:{/green-fg}{/bold}',
+            '{gray-fg}' + '─'.repeat(120) + '{/gray-fg}',
+            responseJson,
+            '',
+          ].join('\n');
+        } else {
+          content = [
+            '{bold}{yellow-fg}' + '═'.repeat(120) + '{/yellow-fg}{/bold}',
+            '{bold}{yellow-fg}  RESPONSE{/yellow-fg}{/bold}',
+            '{bold}{yellow-fg}' + '═'.repeat(120) + '{/yellow-fg}{/bold}',
+            '',
+            '{yellow-fg}(pending - no response yet){/yellow-fg}',
+            '',
+          ].join('\n');
+        }
+      } else {
+        // Both view - side by side with proper column wrapping
+        label = ' REQUEST & RESPONSE - Press 1=Request Only | 2=Response Only | F4/ESC=Close | PgUp/PgDn=Scroll ';
+
+        const requestLines = requestJson.split('\n');
+        const responseLines = responseJson.split('\n');
+
+        // Calculate dynamic column width based on screen
+        const colWidth = 65;
+
+        // Wrap lines that are too long for each column
+        const wrapLine = (line: string, width: number): string[] => {
+          if (!line) return [''];
+
+          const wrapped: string[] = [];
+          let currentLine = line;
+
+          while (currentLine.length > 0) {
+            // Check for color tags and preserve them
+            const stripped = currentLine.replace(/\{[^}]+\}/g, '');
+
+            if (stripped.length <= width) {
+              wrapped.push(currentLine);
+              break;
+            }
+
+            // Find a good break point (space, comma, etc.) within width
+            let breakPoint = width;
+            const visiblePart = stripped.substring(0, width);
+            const lastSpace = Math.max(
+              visiblePart.lastIndexOf(' '),
+              visiblePart.lastIndexOf(','),
+              visiblePart.lastIndexOf(';')
+            );
+
+            if (lastSpace > width * 0.6) { // Only break at space if it's not too early
+              breakPoint = lastSpace + 1;
+            }
+
+            // Extract the part to add (accounting for color tags)
+            let charCount = 0;
+            let cutIndex = 0;
+            let inTag = false;
+
+            for (let i = 0; i < currentLine.length && charCount < breakPoint; i++) {
+              if (currentLine[i] === '{') {
+                inTag = true;
+              } else if (currentLine[i] === '}') {
+                inTag = false;
+              } else if (!inTag) {
+                charCount++;
+              }
+              cutIndex = i + 1;
+            }
+
+            wrapped.push(currentLine.substring(0, cutIndex).trimEnd());
+            currentLine = currentLine.substring(cutIndex).trimStart();
+          }
+
+          return wrapped.length > 0 ? wrapped : [''];
+        };
+
+        // Wrap all request and response lines
+        const wrappedRequestLines: string[] = [];
+        const wrappedResponseLines: string[] = [];
+
+        requestLines.forEach(line => {
+          wrappedRequestLines.push(...wrapLine(line, colWidth));
+        });
+
+        responseLines.forEach(line => {
+          wrappedResponseLines.push(...wrapLine(line, colWidth));
+        });
+
+        const maxLines = Math.max(wrappedRequestLines.length, wrappedResponseLines.length);
+
+        const lines: string[] = [];
+        lines.push('{bold}{cyan-fg}' + '═'.repeat(colWidth) + '╦' + '═'.repeat(colWidth) + '{/cyan-fg}{/bold}');
+
+        // Add metadata header
+        const reqTime = requestLog.timestamp.toISOString();
+        const respTime = responseLog ? responseLog.timestamp.toISOString() : 'pending';
+        const duration = responseLog ? `${responseLog.timestamp.getTime() - requestLog.timestamp.getTime()}ms` : '-';
+
+        const headerLeft = `{bold}{yellow-fg}REQUEST{/yellow-fg}{/bold} (${reqTime})`;
+        const headerRight = `{bold}{green-fg}RESPONSE{/green-fg}{/bold} (${respTime}) Duration: ${duration}`;
+
+        // Calculate padding for header (accounting for color tags)
+        const headerLeftStripped = headerLeft.replace(/\{[^}]+\}/g, '');
+        const headerLeftPadding = ' '.repeat(Math.max(0, colWidth - headerLeftStripped.length));
+
+        lines.push(headerLeft + headerLeftPadding + '{cyan-fg}║{/cyan-fg}' + headerRight);
+        lines.push('{bold}{cyan-fg}' + '─'.repeat(colWidth) + '╫' + '─'.repeat(colWidth) + '{/cyan-fg}{/bold}');
+
+        for (let i = 0; i < maxLines; i++) {
+          const leftLine = wrappedRequestLines[i] || '';
+          const rightLine = wrappedResponseLines[i] || '';
+
+          // Pad left line to exact column width (accounting for color tags)
+          const leftStripped = leftLine.replace(/\{[^}]+\}/g, '');
+          const leftPadding = ' '.repeat(Math.max(0, colWidth - leftStripped.length));
+
+          lines.push(leftLine + leftPadding + '{cyan-fg}║{/cyan-fg}' + rightLine);
+        }
+
+        lines.push('{bold}{cyan-fg}' + '═'.repeat(colWidth) + '╩' + '═'.repeat(colWidth) + '{/cyan-fg}{/bold}');
+
+        content = lines.join('\n');
+      }
+
+      detailBox.setLabel(label);
+      detailBox.setContent(content);
+      this.screen.render();
+    };
+
+    // Initial render
+    updateContent();
+
+    // Key bindings
+    detailBox.key(['tab'], () => {
+      currentView = 'both';
+      updateContent();
+    });
+
+    detailBox.key(['1'], () => {
+      currentView = 'request';
+      updateContent();
+    });
+
+    detailBox.key(['2'], () => {
+      currentView = 'response';
+      updateContent();
+    });
+
+    detailBox.key(['pageup'], () => {
+      detailBox.scroll(-10);
+      this.screen.render();
+    });
+
+    detailBox.key(['pagedown'], () => {
+      detailBox.scroll(10);
+      this.screen.render();
+    });
+
+    detailBox.key(['f4', 'escape', 'q'], () => {
+      detailBox.destroy();
+      this.screen.render();
+    });
+
+    detailBox.focus();
+    this.screen.render();
+  }
+
 
   private formatXML(xml: string): string {
     // Simple XML formatter with indentation
@@ -1433,6 +1875,452 @@ export class TUI {
       this.layout.status.setContent(`{red-fg}Failed to switch connection:{/red-fg} ${error instanceof Error ? error.message : String(error)}`);
       this.addTrafficLine(`{red-fg}Connection switch failed:{/red-fg} ${error instanceof Error ? error.message : String(error)}`);
       this.screen.render();
+    }
+  }
+
+  // Enhanced traffic log features
+  private showFilterDialog() {
+    const filterBox = blessed.box({
+      parent: this.screen,
+      label: ' Filter Traffic ',
+      top: 'center',
+      left: 'center',
+      width: '60%',
+      height: '60%',
+      border: { type: 'line' },
+      style: {
+        border: { fg: 'cyan' },
+      },
+      tags: true,
+      keys: true,
+      vi: true,
+      mouse: true,
+      scrollable: true,
+      scrollbar: {
+        ch: ' ',
+        style: { bg: 'cyan' },
+      },
+    });
+
+    // Get unique methods and transports
+    const logs = this.client?.getTrafficLog() || [];
+    const methods = new Set<string>();
+    const transports = new Set<string>();
+
+    logs.forEach(log => {
+      if ('method' in log.data) methods.add(log.data.method);
+      if (log.transport) transports.add(log.transport);
+    });
+
+    const content = [
+      '{bold}{cyan-fg}Current Filters:{/cyan-fg}{/bold}',
+      `  Method: ${this.trafficFilter.method || '{gray-fg}(none){/gray-fg}'}`,
+      `  Transport: ${this.trafficFilter.transport || '{gray-fg}(none){/gray-fg}'}`,
+      `  Status: ${this.trafficFilter.status}`,
+      `  Search: ${this.trafficFilter.searchText || '{gray-fg}(none){/gray-fg}'}`,
+      '',
+      '{bold}{yellow-fg}Available Options:{/yellow-fg}{/bold}',
+      '',
+      '{cyan-fg}Methods:{/cyan-fg}',
+      ...Array.from(methods).map(m => `  - ${m}`),
+      '',
+      '{cyan-fg}Transports:{/cyan-fg}',
+      ...Array.from(transports).map(t => `  - ${t}`),
+      '',
+      '{cyan-fg}Status Values:{/cyan-fg}',
+      '  - all',
+      '  - success',
+      '  - error',
+      '  - pending',
+      '',
+      '{bold}{green-fg}Actions:{/green-fg}{/bold}',
+      '  1. Press M to filter by method',
+      '  2. Press T to filter by transport',
+      '  3. Press S to filter by status',
+      '  4. Press C to clear all filters',
+      '  5. Press ESC or F4 to close',
+    ];
+
+    filterBox.setContent(content.join('\n'));
+
+    filterBox.key(['m'], () => {
+      this.layout.input.setLabel(' Enter method to filter (or leave empty to clear) ');
+      this.layout.input.setValue(this.trafficFilter.method || '');
+      this.layout.input.show();
+      this.layout.input.focus();
+      this.layout.input.readInput((err, value) => {
+        if (!err) {
+          this.trafficFilter.method = value && value.trim() ? value.trim() : null;
+          this.updateCurrentView();
+        }
+        this.layout.input.hide();
+        filterBox.focus();
+        this.screen.render();
+      });
+    });
+
+    filterBox.key(['t'], () => {
+      this.layout.input.setLabel(' Enter transport to filter (or leave empty to clear) ');
+      this.layout.input.setValue(this.trafficFilter.transport || '');
+      this.layout.input.show();
+      this.layout.input.focus();
+      this.layout.input.readInput((err, value) => {
+        if (!err) {
+          this.trafficFilter.transport = value && value.trim() ? value.trim() : null;
+          this.updateCurrentView();
+        }
+        this.layout.input.hide();
+        filterBox.focus();
+        this.screen.render();
+      });
+    });
+
+    filterBox.key(['s'], () => {
+      this.layout.input.setLabel(' Enter status filter (all/success/error/pending) ');
+      this.layout.input.setValue(this.trafficFilter.status);
+      this.layout.input.show();
+      this.layout.input.focus();
+      this.layout.input.readInput((err, value) => {
+        if (!err && value) {
+          const status = value.trim().toLowerCase();
+          if (['all', 'success', 'error', 'pending'].includes(status)) {
+            this.trafficFilter.status = status as any;
+            this.updateCurrentView();
+          }
+        }
+        this.layout.input.hide();
+        filterBox.focus();
+        this.screen.render();
+      });
+    });
+
+    filterBox.key(['c'], () => {
+      this.trafficFilter.method = null;
+      this.trafficFilter.transport = null;
+      this.trafficFilter.status = 'all';
+      this.trafficFilter.searchText = '';
+      this.updateCurrentView();
+      filterBox.destroy();
+      this.screen.render();
+    });
+
+    filterBox.key(['escape', 'f4'], () => {
+      filterBox.destroy();
+      this.screen.render();
+    });
+
+    this.screen.render();
+    filterBox.focus();
+  }
+
+  private showSearchDialog() {
+    this.layout.input.setLabel(' Search traffic (use /regex/ for regex search) ');
+    this.layout.input.setValue(this.trafficFilter.searchText);
+    this.layout.input.show();
+    this.layout.input.focus();
+    this.layout.input.readInput((err, value) => {
+      if (!err) {
+        let searchText = value || '';
+        let useRegex = false;
+
+        // Check if it's a regex pattern
+        if (searchText.startsWith('/') && searchText.endsWith('/') && searchText.length > 2) {
+          searchText = searchText.slice(1, -1);
+          useRegex = true;
+        }
+
+        this.trafficFilter.searchText = searchText;
+        this.trafficFilter.useRegex = useRegex;
+        this.updateCurrentView();
+      }
+      this.layout.input.hide();
+      this.screen.render();
+    });
+  }
+
+  private showExportDialog() {
+    const exportBox = blessed.box({
+      parent: this.screen,
+      label: ' Export Traffic ',
+      top: 'center',
+      left: 'center',
+      width: '50%',
+      height: '50%',
+      border: { type: 'line' },
+      style: {
+        border: { fg: 'cyan' },
+      },
+      tags: true,
+      keys: true,
+      vi: true,
+      mouse: true,
+    });
+
+    const content = [
+      '{bold}{cyan-fg}Export Traffic Data{/cyan-fg}{/bold}',
+      '',
+      'Choose export format:',
+      '',
+      '{yellow-fg}1.{/yellow-fg} Press J to export as JSON',
+      '{yellow-fg}2.{/yellow-fg} Press C to export as CSV',
+      '{yellow-fg}3.{/yellow-fg} Press ESC to cancel',
+      '',
+      `Current filter will export {bold}${this.filterTrafficLogs(this.client?.getTrafficLog() || []).length}{/bold} records`,
+    ];
+
+    exportBox.setContent(content.join('\n'));
+
+    exportBox.key(['j'], () => {
+      this.exportTrafficJSON();
+      exportBox.destroy();
+      this.screen.render();
+    });
+
+    exportBox.key(['c'], () => {
+      this.exportTrafficCSV();
+      exportBox.destroy();
+      this.screen.render();
+    });
+
+    exportBox.key(['escape', 'f4'], () => {
+      exportBox.destroy();
+      this.screen.render();
+    });
+
+    this.screen.render();
+    exportBox.focus();
+  }
+
+  private exportTrafficJSON() {
+    try {
+      const logs = this.client?.getTrafficLog() || [];
+      const filtered = this.filterTrafficLogs(logs);
+
+      const timestamp = new Date().toISOString().replace(/:/g, '-').split('.')[0];
+      const filename = `traffic_export_${timestamp}.json`;
+      const filepath = path.join(process.cwd(), filename);
+
+      fs.writeFileSync(filepath, JSON.stringify(filtered, null, 2));
+
+      this.addTrafficLine(`{green-fg}Exported ${filtered.length} records to:{/green-fg} ${filename}`);
+      this.screen.render();
+    } catch (error) {
+      this.addTrafficLine(`{red-fg}Export failed:{/red-fg} ${error instanceof Error ? error.message : String(error)}`);
+      this.screen.render();
+    }
+  }
+
+  private exportTrafficCSV() {
+    try {
+      const logs = this.client?.getTrafficLog() || [];
+      const filtered = this.filterTrafficLogs(logs);
+
+      // Build CSV
+      const headers = ['Timestamp', 'Direction', 'Transport', 'Method', 'Status', 'Data'];
+      const rows = filtered.map(log => {
+        const method = ('method' in log.data) ? log.data.method : '';
+        const status = log.direction === 'received'
+          ? ('error' in log.data ? 'ERROR' : 'OK')
+          : 'SENT';
+        const data = JSON.stringify(log.data).replace(/"/g, '""'); // Escape quotes
+
+        return [
+          log.timestamp.toISOString(),
+          log.direction,
+          log.transport || '',
+          method,
+          status,
+          `"${data}"`
+        ].join(',');
+      });
+
+      const csv = [headers.join(','), ...rows].join('\n');
+
+      const timestamp = new Date().toISOString().replace(/:/g, '-').split('.')[0];
+      const filename = `traffic_export_${timestamp}.csv`;
+      const filepath = path.join(process.cwd(), filename);
+
+      fs.writeFileSync(filepath, csv);
+
+      this.addTrafficLine(`{green-fg}Exported ${filtered.length} records to:{/green-fg} ${filename}`);
+      this.screen.render();
+    } catch (error) {
+      this.addTrafficLine(`{red-fg}Export failed:{/red-fg} ${error instanceof Error ? error.message : String(error)}`);
+      this.screen.render();
+    }
+  }
+
+  private showStatsDialog() {
+    const statsBox = blessed.box({
+      parent: this.screen,
+      label: ' Traffic Statistics ',
+      top: 'center',
+      left: 'center',
+      width: '70%',
+      height: '80%',
+      border: { type: 'line' },
+      style: {
+        border: { fg: 'cyan' },
+      },
+      tags: true,
+      keys: true,
+      vi: true,
+      mouse: true,
+      scrollable: true,
+      scrollbar: {
+        ch: ' ',
+        style: { bg: 'cyan' },
+      },
+    });
+
+    const successRate = this.trafficStats.totalRequests > 0
+      ? ((this.trafficStats.successCount / this.trafficStats.totalRequests) * 100).toFixed(1)
+      : '0.0';
+    const errorRate = this.trafficStats.totalRequests > 0
+      ? ((this.trafficStats.errorCount / this.trafficStats.totalRequests) * 100).toFixed(1)
+      : '0.0';
+
+    const content = [
+      '{bold}{cyan-fg}═══════════════════════════════════════════════════════════════{/cyan-fg}{/bold}',
+      '{bold}{cyan-fg}                    TRAFFIC STATISTICS                          {/cyan-fg}{/bold}',
+      '{bold}{cyan-fg}═══════════════════════════════════════════════════════════════{/cyan-fg}{/bold}',
+      '',
+      '{bold}{yellow-fg}Overall Statistics:{/yellow-fg}{/bold}',
+      `  Total Requests:     {bold}${this.trafficStats.totalRequests}{/bold}`,
+      `  Successful:         {green-fg}{bold}${this.trafficStats.successCount}{/bold}{/green-fg} (${successRate}%)`,
+      `  Errors:             {red-fg}{bold}${this.trafficStats.errorCount}{/bold}{/red-fg} (${errorRate}%)`,
+      `  Pending:            {yellow-fg}{bold}${this.trafficStats.pendingCount}{/bold}{/yellow-fg}`,
+      `  Avg Response Time:  {bold}${this.trafficStats.avgResponseTime.toFixed(0)}ms{/bold}`,
+      '',
+      '{bold}{yellow-fg}Method Distribution:{/yellow-fg}{/bold}',
+    ];
+
+    // Sort methods by count
+    const sortedMethods = Array.from(this.trafficStats.methodCounts.entries())
+      .sort((a, b) => b[1] - a[1]);
+
+    sortedMethods.forEach(([method, count]) => {
+      const percentage = ((count / this.trafficStats.totalRequests) * 100).toFixed(1);
+      const barLength = Math.round((count / this.trafficStats.totalRequests) * 40);
+      const bar = '█'.repeat(barLength);
+      content.push(`  ${method.padEnd(25)} {cyan-fg}${bar}{/cyan-fg} ${count} (${percentage}%)`);
+    });
+
+    content.push('');
+    content.push('{bold}{green-fg}Press ESC or F4 to close{/green-fg}{/bold}');
+
+    statsBox.setContent(content.join('\n'));
+
+    statsBox.key(['escape', 'f4'], () => {
+      statsBox.destroy();
+      this.screen.render();
+    });
+
+    this.screen.render();
+    statsBox.focus();
+  }
+
+  private replaySelectedRequest() {
+    if (!this.client) return;
+
+    const selected = (this.layout.main as any).selected || 0;
+    const logs = this.client.getTrafficLog();
+    const filtered = this.filterTrafficLogs(logs);
+
+    // Adjust for header rows (stats + blank + header + separator = 4 rows)
+    const actualIndex = selected - 4;
+    if (actualIndex < 0 || actualIndex >= filtered.length) return;
+
+    const processedIds = new Set<number | string>();
+    let currentIndex = 0;
+
+    for (let i = 0; i < filtered.length; i++) {
+      const log = filtered[i];
+
+      if ('id' in log.data) {
+        const logId = (log.data as any).id;
+        if (processedIds.has(logId)) continue;
+        processedIds.add(logId);
+      }
+
+      if (currentIndex === actualIndex) {
+        // Found the request
+        if (log.direction === 'sent' && 'method' in log.data) {
+          // Show confirmation dialog
+          const confirmBox = blessed.box({
+            parent: this.screen,
+            label: ' Replay Request? ',
+            top: 'center',
+            left: 'center',
+            width: '60%',
+            height: '50%',
+            border: { type: 'line' },
+            style: {
+              border: { fg: 'yellow' },
+            },
+            tags: true,
+            keys: true,
+          });
+
+          const method = log.data.method;
+          const params = (log.data as any).params || {};
+
+          confirmBox.setContent([
+            '{bold}{yellow-fg}Replay this request?{/yellow-fg}{/bold}',
+            '',
+            `{cyan-fg}Method:{/cyan-fg} ${method}`,
+            `{cyan-fg}Parameters:{/cyan-fg}`,
+            JSON.stringify(params, null, 2),
+            '',
+            '{green-fg}Press Y to replay, N to cancel{/green-fg}',
+          ].join('\n'));
+
+          confirmBox.key(['y'], async () => {
+            confirmBox.destroy();
+            try {
+              // Replay the request based on method type
+              let result;
+              switch (method) {
+                case 'tools/call':
+                  result = await this.client!.callTool(params.name, params.arguments);
+                  break;
+                case 'resources/read':
+                  result = await this.client!.readResource(params.uri);
+                  break;
+                case 'prompts/get':
+                  result = await this.client!.getPrompt(params.name, params.arguments);
+                  break;
+                case 'tools/list':
+                  result = await this.client!.listTools();
+                  break;
+                case 'resources/list':
+                  result = await this.client!.listResources();
+                  break;
+                case 'prompts/list':
+                  result = await this.client!.listPrompts();
+                  break;
+                default:
+                  throw new Error(`Cannot replay method: ${method}`);
+              }
+              this.addTrafficLine(`{green-fg}Replayed request:{/green-fg} ${method}`);
+            } catch (error) {
+              this.addTrafficLine(`{red-fg}Replay failed:{/red-fg} ${error instanceof Error ? error.message : String(error)}`);
+            }
+            this.screen.render();
+          });
+
+          confirmBox.key(['n', 'escape'], () => {
+            confirmBox.destroy();
+            this.screen.render();
+          });
+
+          this.screen.render();
+          confirmBox.focus();
+        }
+        break;
+      }
+
+      currentIndex++;
     }
   }
 }
