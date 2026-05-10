@@ -132,6 +132,9 @@ export class HttpTransport extends Transport {
         headers: {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(payload),
+          // MCP Streamable HTTP requires both content types — the server may
+          // answer with either a JSON response or an SSE stream.
+          'Accept': 'application/json, text/event-stream',
           ...this.customHeaders,
           ...this.authHeaders,
           ...(this.cookies.size > 0 ? { 'Cookie': Array.from(this.cookies.entries()).map(([k, v]) => `${k}=${v}`).join('; ') } : {}),
