@@ -22,6 +22,7 @@ export class SSETransport extends Transport {
   private lastEventId?: string;
   private reconnecting = false;
   private endpoint: string;
+  private tlsOptions: https.AgentOptions = {};
 
   constructor(
     private url: string,
@@ -39,7 +40,29 @@ export class SSETransport extends Transport {
     this.endpoint = urlObj.pathname + urlObj.search;
 
     this.setupAuthHeaders();
+    this.setupTlsOptions();
     this.setupAgent();
+  }
+
+  private setupTlsOptions(): void {
+    if (!this.certificateConfig) {
+      return;
+    }
+    if (this.certificateConfig.cert) {
+      this.tlsOptions.cert = fs.readFileSync(this.certificateConfig.cert);
+    }
+    if (this.certificateConfig.key) {
+      this.tlsOptions.key = fs.readFileSync(this.certificateConfig.key);
+    }
+    if (this.certificateConfig.ca) {
+      this.tlsOptions.ca = fs.readFileSync(this.certificateConfig.ca);
+    }
+    if (this.certificateConfig.passphrase) {
+      this.tlsOptions.passphrase = this.certificateConfig.passphrase;
+    }
+    if (this.certificateConfig.rejectUnauthorized !== undefined) {
+      this.tlsOptions.rejectUnauthorized = this.certificateConfig.rejectUnauthorized;
+    }
   }
 
   private setupAuthHeaders(): void {
@@ -68,25 +91,7 @@ export class SSETransport extends Transport {
   }
 
   private setupAgent(): void {
-    const agentOptions: https.AgentOptions = {};
-
-    if (this.certificateConfig) {
-      if (this.certificateConfig.cert) {
-        agentOptions.cert = fs.readFileSync(this.certificateConfig.cert);
-      }
-      if (this.certificateConfig.key) {
-        agentOptions.key = fs.readFileSync(this.certificateConfig.key);
-      }
-      if (this.certificateConfig.ca) {
-        agentOptions.ca = fs.readFileSync(this.certificateConfig.ca);
-      }
-      if (this.certificateConfig.passphrase) {
-        agentOptions.passphrase = this.certificateConfig.passphrase;
-      }
-      if (this.certificateConfig.rejectUnauthorized !== undefined) {
-        agentOptions.rejectUnauthorized = this.certificateConfig.rejectUnauthorized;
-      }
-    }
+    const agentOptions: https.AgentOptions = { ...this.tlsOptions };
 
     if (!this.proxyConfig) {
       if (Object.keys(agentOptions).length > 0 && this.isHttps) {
@@ -145,6 +150,9 @@ export class SSETransport extends Transport {
         method: 'GET',
         headers,
         agent: this.agent,
+        // TLS options must also be on the request to govern the target-server
+        // handshake when tunneling through a proxy (e.g. Burp).
+        ...this.tlsOptions,
       };
 
       const req = httpModule.request(options, (res) => {
@@ -282,6 +290,9 @@ export class SSETransport extends Transport {
         method: 'POST',
         headers,
         agent: this.agent,
+        // TLS options must also be on the request to govern the target-server
+        // handshake when tunneling through a proxy (e.g. Burp).
+        ...this.tlsOptions,
       };
 
       const req = httpModule.request(options, (res) => {

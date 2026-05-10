@@ -13,6 +13,7 @@ export class HttpTransport extends Transport {
   private authHeaders: Record<string, string> = {};
   private customHeaders: Record<string, string> = {};
   private cookies: Map<string, string> = new Map();
+  private tlsOptions: https.AgentOptions = {};
 
   constructor(
     private url: string,
@@ -25,7 +26,29 @@ export class HttpTransport extends Transport {
     this.isHttps = url.startsWith('https://');
     this.customHeaders = customHeaders || {};
     this.setupAuthHeaders();
+    this.setupTlsOptions();
     this.setupAgent();
+  }
+
+  private setupTlsOptions(): void {
+    if (!this.certificateConfig) {
+      return;
+    }
+    if (this.certificateConfig.cert) {
+      this.tlsOptions.cert = fs.readFileSync(this.certificateConfig.cert);
+    }
+    if (this.certificateConfig.key) {
+      this.tlsOptions.key = fs.readFileSync(this.certificateConfig.key);
+    }
+    if (this.certificateConfig.ca) {
+      this.tlsOptions.ca = fs.readFileSync(this.certificateConfig.ca);
+    }
+    if (this.certificateConfig.passphrase) {
+      this.tlsOptions.passphrase = this.certificateConfig.passphrase;
+    }
+    if (this.certificateConfig.rejectUnauthorized !== undefined) {
+      this.tlsOptions.rejectUnauthorized = this.certificateConfig.rejectUnauthorized;
+    }
   }
 
   private setupAuthHeaders(): void {
@@ -54,25 +77,7 @@ export class HttpTransport extends Transport {
   }
 
   private setupAgent(): void {
-    const agentOptions: https.AgentOptions = {};
-
-    if (this.certificateConfig) {
-      if (this.certificateConfig.cert) {
-        agentOptions.cert = fs.readFileSync(this.certificateConfig.cert);
-      }
-      if (this.certificateConfig.key) {
-        agentOptions.key = fs.readFileSync(this.certificateConfig.key);
-      }
-      if (this.certificateConfig.ca) {
-        agentOptions.ca = fs.readFileSync(this.certificateConfig.ca);
-      }
-      if (this.certificateConfig.passphrase) {
-        agentOptions.passphrase = this.certificateConfig.passphrase;
-      }
-      if (this.certificateConfig.rejectUnauthorized !== undefined) {
-        agentOptions.rejectUnauthorized = this.certificateConfig.rejectUnauthorized;
-      }
-    }
+    const agentOptions: https.AgentOptions = { ...this.tlsOptions };
 
     if (!this.proxyConfig) {
       if (Object.keys(agentOptions).length > 0 && this.isHttps) {
@@ -132,6 +137,10 @@ export class HttpTransport extends Transport {
           ...(this.cookies.size > 0 ? { 'Cookie': Array.from(this.cookies.entries()).map(([k, v]) => `${k}=${v}`).join('; ') } : {}),
         },
         agent: this.agent,
+        // Apply TLS options to the request itself so they govern the
+        // target-server TLS handshake when tunneling through a proxy.
+        // (Constructor opts on https-proxy-agent only cover the proxy hop.)
+        ...this.tlsOptions,
       };
 
       const req = httpModule.request(options, (res) => {

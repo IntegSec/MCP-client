@@ -11,6 +11,7 @@ export class WebSocketTransport extends Transport {
   private agent?: any;
   private authHeaders: Record<string, string> = {};
   private customHeaders: Record<string, string> = {};
+  private tlsOptions: Record<string, any> = {};
 
   constructor(
     private url: string,
@@ -22,7 +23,29 @@ export class WebSocketTransport extends Transport {
     super();
     this.customHeaders = customHeaders || {};
     this.setupAuthHeaders();
+    this.setupTlsOptions();
     this.setupAgent();
+  }
+
+  private setupTlsOptions(): void {
+    if (!this.certificateConfig) {
+      return;
+    }
+    if (this.certificateConfig.cert) {
+      this.tlsOptions.cert = fs.readFileSync(this.certificateConfig.cert);
+    }
+    if (this.certificateConfig.key) {
+      this.tlsOptions.key = fs.readFileSync(this.certificateConfig.key);
+    }
+    if (this.certificateConfig.ca) {
+      this.tlsOptions.ca = fs.readFileSync(this.certificateConfig.ca);
+    }
+    if (this.certificateConfig.passphrase) {
+      this.tlsOptions.passphrase = this.certificateConfig.passphrase;
+    }
+    if (this.certificateConfig.rejectUnauthorized !== undefined) {
+      this.tlsOptions.rejectUnauthorized = this.certificateConfig.rejectUnauthorized;
+    }
   }
 
   private setupAuthHeaders(): void {
@@ -51,33 +74,11 @@ export class WebSocketTransport extends Transport {
   }
 
   private setupAgent(): void {
-    const agentOptions: any = {};
-
-    if (this.certificateConfig) {
-      if (this.certificateConfig.cert) {
-        agentOptions.cert = fs.readFileSync(this.certificateConfig.cert);
-      }
-      if (this.certificateConfig.key) {
-        agentOptions.key = fs.readFileSync(this.certificateConfig.key);
-      }
-      if (this.certificateConfig.ca) {
-        agentOptions.ca = fs.readFileSync(this.certificateConfig.ca);
-      }
-      if (this.certificateConfig.passphrase) {
-        agentOptions.passphrase = this.certificateConfig.passphrase;
-      }
-      if (this.certificateConfig.rejectUnauthorized !== undefined) {
-        agentOptions.rejectUnauthorized = this.certificateConfig.rejectUnauthorized;
-      }
-    }
+    const agentOptions: any = { ...this.tlsOptions };
 
     if (!this.proxyConfig) {
-      if (Object.keys(agentOptions).length > 0) {
-        const isSecure = this.url.startsWith('wss://');
-        if (isSecure) {
-          this.agent = new HttpsProxyAgent('https://dummy', agentOptions);
-        }
-      }
+      // No proxy: ws library reads TLS options directly from ClientOptions,
+      // so we don't need an agent here.
       return;
     }
 
@@ -103,7 +104,10 @@ export class WebSocketTransport extends Transport {
 
   async connect(): Promise<void> {
     return new Promise((resolve, reject) => {
-      const options: WebSocket.ClientOptions = {};
+      // Spread TLS options so they apply to the WebSocket TLS handshake even
+      // when tunneling through a proxy (constructor opts on the proxy agent
+      // only cover the proxy hop, not the target handshake).
+      const options: WebSocket.ClientOptions = { ...this.tlsOptions };
 
       if (this.agent) {
         options.agent = this.agent;
