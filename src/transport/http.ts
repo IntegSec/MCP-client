@@ -14,6 +14,7 @@ export class HttpTransport extends Transport {
   private customHeaders: Record<string, string> = {};
   private cookies: Map<string, string> = new Map();
   private tlsOptions: https.AgentOptions = {};
+  private sessionId?: string;
 
   constructor(
     private url: string,
@@ -135,6 +136,10 @@ export class HttpTransport extends Transport {
           // MCP Streamable HTTP requires both content types — the server may
           // answer with either a JSON response or an SSE stream.
           'Accept': 'application/json, text/event-stream',
+          // Echo back the session ID assigned by the server on initialize so
+          // subsequent requests (notifications/initialized, tools/list, ...)
+          // bind to the same session.
+          ...(this.sessionId ? { 'Mcp-Session-Id': this.sessionId } : {}),
           ...this.customHeaders,
           ...this.authHeaders,
           ...(this.cookies.size > 0 ? { 'Cookie': Array.from(this.cookies.entries()).map(([k, v]) => `${k}=${v}`).join('; ') } : {}),
@@ -155,6 +160,13 @@ export class HttpTransport extends Transport {
 
         res.on('end', () => {
           try {
+            // Capture the MCP session ID assigned by the server (typically on
+            // the initialize response). Node lowercases response header keys.
+            const sessionIdHeader = res.headers['mcp-session-id'];
+            if (sessionIdHeader) {
+              this.sessionId = Array.isArray(sessionIdHeader) ? sessionIdHeader[0] : sessionIdHeader;
+            }
+
             // Extract cookies from response headers
             const setCookieHeaders = res.headers['set-cookie'];
             if (setCookieHeaders) {
